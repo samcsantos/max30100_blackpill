@@ -18,10 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,6 +62,9 @@ typedef struct {
 // Endereços verificação
 #define MAX30100_PWR_RDY 		  0x01
 #define MAX30100_PART_ID 		  0xFF
+
+
+#define MAX30100_MAX_DELAY		  10
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -81,6 +85,8 @@ uint8_t *ptrDev = devices;
 uint8_t fifo_buffer[64];
 uint8_t *ptrFifo_buffer = fifo_buffer;
 
+uint8_t usbData = 0;
+
 sampleData_t rawSample;
 
 //uint16_t ir_sample = 0;
@@ -90,7 +96,9 @@ HAL_StatusTypeDef cfgOk;
 
 volatile uint8_t dmaTransferActive = 0;
 volatile uint8_t rxCplt = 0;
-volatile uint8_t newSamples = 0;
+volatile uint8_t newInterrupt = 0;
+
+volatile USBD_StatusTypeDef usbTxCplt = USBD_OK;
 
 uint8_t samplesSize = 0;
 /* USER CODE END PV */
@@ -101,6 +109,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
+extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 void I2C_Bus_Clear(void);
 HAL_StatusTypeDef max30100_init();
 HAL_StatusTypeDef max30100_WriteReg(I2C_HandleTypeDef *hi2c, uint8_t regAddr, uint8_t modeCfg);
@@ -119,6 +128,7 @@ HAL_StatusTypeDef max30100_ReadReg(I2C_HandleTypeDef *hi2c, uint8_t regAddr, uin
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
 
@@ -144,6 +154,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
   // Verificação se o microcontrolador é Big-Endian ou Little-Endian
@@ -170,34 +181,65 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if(newSamples){
-		  newSamples = 0;
+	  if(newInterrupt){
+		  newInterrupt = 0;
 		  uint8_t fifoRdPtr = 0, fifoWrPtr = 0;
 		  int8_t numSamples = 0;
-		  max30100_ReadReg(&hi2c1, MAX30100_FIFO_WR_PTR, &fifoWrPtr);
-		  max30100_ReadReg(&hi2c1, MAX30100_FIFO_RD_PTR, &fifoRdPtr);
+		  static uint8_t statusReg = 0;
+		  if(HAL_I2C_Mem_Read(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_INTERRUPT_STATUS, I2C_MEMADD_SIZE_8BIT, &statusReg, sizeof(statusReg), MAX30100_MAX_DELAY) == HAL_OK){
+			  if(statusReg && 0x01){
+				  I2C_Bus_Clear();
+				  max30100_init();
+			  } else {
+				  max30100_ReadReg(&hi2c1, MAX30100_FIFO_WR_PTR, &fifoWrPtr);
+				  max30100_ReadReg(&hi2c1, MAX30100_FIFO_RD_PTR, &fifoRdPtr);
 
-		  numSamples = (fifoWrPtr - fifoRdPtr) & 0x0F;
-		  if(numSamples <= 0){
-			  numSamples = 16;
+				  numSamples = (fifoWrPtr - fifoRdPtr) & 0x0F;
+				  if(numSamples <= 0){
+					  numSamples = 16;
+				  }
+				  samplesSize = numSamples * 4;
+				  //
+				  dmaTransferActive = 1;	// Flag para verificação no callback
+				  HAL_I2C_Mem_Read_DMA(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_FIFO_DATA, I2C_MEMADD_SIZE_8BIT, ptrFifo_buffer, samplesSize);
+			  }
 		  }
-		  samplesSize = numSamples * 4;
-		  //
-		  dmaTransferActive = 1;	// Flag para verificação no callback
-		  HAL_I2C_Mem_Read_DMA(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_FIFO_DATA, I2C_MEMADD_SIZE_8BIT, ptrFifo_buffer, samplesSize);
 	  }
-	  if(rxCplt > 10){
+	  if(rxCplt){
 		  rxCplt = 0;
-		  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-	  }
+		  uint16_t txLen = 0;
+		  uint32_t timeout = 0;
+		  char msgBuffer[64];
+		  for(uint8_t i = 0; i < samplesSize; i+=4){
+			  // Carrega os dados do fifo_buffer nas variáveis da struct
+			  rawSample.ir_sample  = fifo_buffer[i+0]<<8 | fifo_buffer[i+1];
+			  rawSample.red_sample = fifo_buffer[i+2]<<8 | fifo_buffer[i+3];
+			  // Carrega os valores das amostras em uma string e a função sprintf retorna o tamanho alocado
+			  txLen = sprintf(msgBuffer, "ir: %u, red: %u\n", rawSample.ir_sample, rawSample.red_sample);
+			  // Testa se a flag está livre, se não estiver aguarda até o timeout predefinido
+			  timeout = HAL_GetTick();
+			  while(usbTxCplt != USBD_OK){
+				  if(HAL_GetTick() - timeout > MAX30100_MAX_DELAY){
+					  break; 	// Se chegou no timeout, o laço é interrompido e segue o código, mesmo com a USB travada/ desconectada
+				  }
+			  }
+			  // Marca ocupado e envia nova amostra
+			  usbTxCplt = USBD_BUSY;
+			  if(CDC_Transmit_FS((uint8_t*)msgBuffer, txLen) != USBD_OK){ // Se o envio falhar, reseta a flag para nova tentativa
+				  usbTxCplt = USBD_OK;
+			  }
+
+		  }
+
+
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+	  }
   /* USER CODE END 3 */
+  }
 }
-
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -219,10 +261,10 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 12;
-  RCC_OscInitStruct.PLL.PLLN = 96;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLM = 15;
+  RCC_OscInitStruct.PLL.PLLN = 144;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -237,7 +279,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -346,7 +388,7 @@ HAL_StatusTypeDef max30100_init(){
     HAL_StatusTypeDef status;
 
     HAL_Delay(100);		// Garantir estabilização da alimentação
-    status = HAL_I2C_Mem_Read(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_PART_ID, I2C_MEMADD_SIZE_8BIT, &part_id, sizeof(part_id), HAL_MAX_DELAY);
+    status = HAL_I2C_Mem_Read(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_PART_ID, I2C_MEMADD_SIZE_8BIT, &part_id, sizeof(part_id), MAX30100_MAX_DELAY);
     if(status != HAL_OK || part_id != 0x11){
     	return HAL_ERROR;
     }
@@ -372,18 +414,17 @@ HAL_StatusTypeDef max30100_init(){
 
 HAL_StatusTypeDef max30100_WriteReg(I2C_HandleTypeDef *hi2c, uint8_t regAddr, uint8_t modeCfg){
 	//HAL_I2C_Mem_Write(hi2c, DevAddress, MemAddress, MemAddSize, pData, Size, Timeout);
-	return HAL_I2C_Mem_Write(hi2c, MAX30100_DEVICE_ADDRESS, regAddr, I2C_MEMADD_SIZE_8BIT, &modeCfg, sizeof(modeCfg), HAL_MAX_DELAY);
+	return HAL_I2C_Mem_Write(hi2c, MAX30100_DEVICE_ADDRESS, regAddr, I2C_MEMADD_SIZE_8BIT, &modeCfg, sizeof(modeCfg), MAX30100_MAX_DELAY);
 }
 
 HAL_StatusTypeDef max30100_ReadReg(I2C_HandleTypeDef *hi2c, uint8_t regAddr, uint8_t *pValue){
-	return HAL_I2C_Mem_Read(hi2c, MAX30100_DEVICE_ADDRESS, regAddr, I2C_MEMADD_SIZE_8BIT, pValue, 1, HAL_MAX_DELAY);
+	return HAL_I2C_Mem_Read(hi2c, MAX30100_DEVICE_ADDRESS, regAddr, I2C_MEMADD_SIZE_8BIT, pValue, 1, MAX30100_MAX_DELAY);
 
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 	if(GPIO_Pin == GPIO_PIN_9){
-		newSamples = 1;
-		//HAL_I2C_Mem_Read_DMA(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_FIFO_DATA, I2C_MEMADD_SIZE_8BIT, ptrFifo_buffer, sizeof(fifo_buffer));
+		newInterrupt = 1;
 	}
 
 }
@@ -392,20 +433,9 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef* hi2c){
 	if(hi2c->Instance == I2C1){
 		if(dmaTransferActive){
 			dmaTransferActive = 0;
-			static uint8_t statusReg = 0;
-			sampleData_t *ptrRawSample = &rawSample;
-			for(uint8_t i = 0; i < samplesSize; i+=4){
-				ptrRawSample->ir_sample  = (fifo_buffer[i+0]<<8) | fifo_buffer[i+1];
-				ptrRawSample->red_sample = (fifo_buffer[i+2]<<8) | fifo_buffer[i+3];
-			}
-			HAL_I2C_Mem_Read(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_INTERRUPT_STATUS, I2C_MEMADD_SIZE_8BIT, &statusReg, sizeof(statusReg), HAL_MAX_DELAY);
-
-			if(statusReg & 0x01){
-				I2C_Bus_Clear();
-				max30100_init();
-			}
-			//max30100_ReadReg(&hi2c1, MAX30100_INTERRUPT_STATUS, &dummyStatus);
-			rxCplt++;
+			static uint8_t dummyStatus = 0;
+			HAL_I2C_Mem_Read(&hi2c1, MAX30100_DEVICE_ADDRESS, MAX30100_INTERRUPT_STATUS, I2C_MEMADD_SIZE_8BIT, &dummyStatus, sizeof(dummyStatus), MAX30100_MAX_DELAY);
+			rxCplt = 1;
 		}
 	}
 }
