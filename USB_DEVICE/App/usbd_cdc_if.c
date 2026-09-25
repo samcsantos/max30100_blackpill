@@ -31,7 +31,7 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-
+extern volatile USBD_StatusTypeDef usbTxCplt;
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -311,6 +311,8 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  usbTxCplt = USBD_OK;
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
   /* USER CODE END 13 */
   return result;
 }
